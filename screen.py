@@ -67,8 +67,13 @@ import yt_dlp
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks.python import BaseOptions
+    from mediapipe.tasks.python.vision import (
+        FaceLandmarker, FaceLandmarkerOptions, RunningMode,
+    )
 except ImportError:
     mp = None
+    BaseOptions = FaceLandmarker = FaceLandmarkerOptions = RunningMode = None
 
 try:
     import webrtcvad
@@ -273,17 +278,44 @@ def retry(fn, cfg: Config):
 # Tầng 1 — face detection + headpose trên frame tĩnh
 # ---------------------------------------------------------------------------
 
-def get_face_mesh():
-    if mp is None:
-        raise RuntimeError("mediapipe chưa được cài đặt (pip install mediapipe)")
-    if not hasattr(_thread_local, "face_mesh"):
-        _thread_local.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=False,
-            min_detection_confidence=0.5,
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+FACE_LANDMARKER_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task"
+)
+
+
+def ensure_face_landmarker_model() -> str:
+    """Tải model face_landmarker.task (~4MB) về cạnh script nếu chưa có.
+    Chỉ cần mạng ở lần chạy đầu tiên; các lần sau dùng file cache sẵn."""
+    if not os.path.exists(FACE_LANDMARKER_MODEL_PATH):
+        import urllib.request
+        logger.info("Đang tải model face_landmarker.task lần đầu...")
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, FACE_LANDMARKER_MODEL_PATH)
+    return FACE_LANDMARKER_MODEL_PATH
+
+
+def get_face_landmarker():
+    """mediapipe bản mới đã bỏ API cũ `mp.solutions.face_mesh` -> dùng Tasks
+    API (`FaceLandmarker`). Cùng bộ 468 điểm landmark, chỉ số dùng ở
+    LM_NOSE_TIP/LM_CHIN/... vẫn đúng như cũ."""
+    if mp is None or FaceLandmarker is None:
+        raise RuntimeError(
+            "mediapipe chưa được cài đặt hoặc thiếu Tasks API "
+            "(pip install -U mediapipe, cần bản >=0.10)"
         )
-    return _thread_local.face_mesh
+    if not hasattr(_thread_local, "face_landmarker"):
+        model_path = ensure_face_landmarker_model()
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+        )
+        _thread_local.face_landmarker = FaceLandmarker.create_from_options(options)
+    return _thread_local.face_landmarker
 
 
 def euler_from_rotation_matrix(R: np.ndarray):
@@ -337,12 +369,13 @@ def analyze_frame(frame_path: str, cfg: Config) -> dict:
 
     h, w = img.shape[:2]
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = get_face_mesh().process(img_rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+    detect_result = get_face_landmarker().detect(mp_image)
 
-    if not results.multi_face_landmarks:
+    if not detect_result.face_landmarks:
         return {"face_found": False, "headpose_ok": False}
 
-    landmarks = results.multi_face_landmarks[0].landmark
+    landmarks = detect_result.face_landmarks[0]
     pose = get_head_pose(landmarks, w, h)
     if pose is None:
         return {"face_found": True, "headpose_ok": False}
