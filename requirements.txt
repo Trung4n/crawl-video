@@ -1,4 +1,5 @@
 yt_dlp
+yt-dlp-ejs
 pandas
 matplotlib
 opencv-python-headless
