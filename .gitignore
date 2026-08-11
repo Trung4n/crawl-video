@@ -1,0 +1,4 @@
+venv/
+*.csv
+samples/
+__pycache__/
