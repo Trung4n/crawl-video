@@ -29,16 +29,23 @@ Ghi chú quan trọng (kế thừa từ các bug đã gặp trước đó):
   - Luôn gắn http_headers từ yt-dlp khi gọi ffmpeg trực tiếp để tránh lỗi 403.
   - URL trực tiếp chỉ có hạn dùng vài giờ -> lấy info và xử lý liền cho từng
     video trong cùng 1 worker, không tách rời quá xa về thời gian.
-  - Tầng 1 và tầng 2 lấy info ở 2 độ phân giải khác nhau (240p vs 360p) nên
-    mỗi tầng cần 1 lần extract_info riêng — nhưng trong mỗi tầng, duration +
-    direct_url + headers được gộp vào đúng 1 lần gọi (không gọi 2 lần).
+  - Tier 1 chỉ cần VIDEO (trích frame), tier 2 chỉ cần AUDIO (VAD) -> mỗi
+    tầng tự extract_info với format riêng (`kind="video"` / `kind="audio"`),
+    tránh đòi progressive stream (video+audio chung 1 file) vốn ngày càng
+    hiếm trên YouTube ở các mốc phân giải thấp và hay gây lỗi
+    "Requested format is not available". Trong mỗi tầng vẫn chỉ 1 lần
+    extract_info (duration + direct_url + headers gộp chung).
+  - Nếu vẫn gặp nhiều lỗi format/extraction, cân nhắc cài 1 JS runtime
+    (vd `deno`) để yt-dlp giải mã signature YouTube ổn định hơn — xem
+    cảnh báo "No supported JavaScript runtime" khi chạy.
 
 Điểm cần xác nhận / dễ đổi:
-  - Cách xác nhận "đang nói chuyện" ở tầng 2 hiện dùng VAD trên audio
-    (đơn giản, không cần audio-visual sync, đủ tốt cho sàng lọc thô). Nếu
-    muốn chuyển sang lip-movement hoặc SyncNet, chỉ cần thay thế lời gọi
-    hàm `vad_speech_ratio()` trong `process_video()` bằng hàm mới tương ứng
-    (video của clip đã tải sẵn ở `clip_path`, không cần tải lại).
+  - Cách xác nhận "đang nói chuyện" ở tầng 2 hiện dùng VAD trên audio-only
+    (đơn giản, nhẹ, không cần tải video). Nếu muốn chuyển sang lip-movement
+    hoặc SyncNet (cần cả video), đổi lời gọi `get_video_info(url, cfg,
+    kind="audio")` ở tier 2 thành `kind="progressive"` (hoặc tải riêng
+    video+audio rồi mux bằng `-map`), rồi thay `vad_speech_ratio()` bằng
+    hàm phân tích video mới.
 """
 
 import os
@@ -137,11 +144,38 @@ def build_header_string(headers: dict) -> str:
     return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
 
-def get_video_info(url: str, max_height: int, cfg: Config) -> dict:
+def build_format_string(kind: str, max_height: Optional[int] = None) -> str:
+    """
+    Chuỗi format cho yt-dlp, tuỳ theo thứ cần lấy:
+      - "video": chỉ cần luồng video (dùng cho tier 1 - trích frame, không cần audio).
+        Progressive stream (video+audio) ngày càng hiếm ở các mốc thấp, nên ưu tiên
+        bestvideo (thường là DASH, vẫn seek nhanh qua HTTP range như bình thường).
+      - "audio": chỉ cần luồng audio (dùng cho tier 2 - VAD, không cần video).
+      - "progressive": cần 1 file có cả video+audio (dự phòng nếu sau này đổi sang
+        phương pháp cần video ở tier 2, ví dụ lip-movement).
+    Luôn có chuỗi fallback "/best" ở cuối để giảm tỉ lệ "format not available"
+    trên các video không còn giữ format ở độ phân giải mong muốn.
+    """
+    h = max_height or 99999
+    if kind == "video":
+        return (
+            f"bestvideo[height<={h}][ext=mp4]/bestvideo[height<={h}]/"
+            f"best[height<={h}]/bestvideo/best"
+        )
+    if kind == "audio":
+        return "bestaudio[ext=m4a]/bestaudio/best"
+    # progressive
+    return (
+        f"best[height<={h}][ext=mp4][acodec!=none][vcodec!=none]/"
+        f"best[height<={h}][acodec!=none][vcodec!=none]/best[height<={h}]/best"
+    )
+
+
+def get_video_info(url: str, cfg: Config, kind: str = "video", max_height: Optional[int] = None) -> dict:
     """1 lần gọi extract_info duy nhất -> duration + direct_url + headers."""
     ydl_opts = {
         "quiet": True,
-        "format": f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]",
+        "format": build_format_string(kind, max_height),
     }
     if cfg.cookiefile:
         ydl_opts["cookiefile"] = cfg.cookiefile
@@ -366,9 +400,9 @@ def process_video(video_id: str, cfg: Config) -> dict:
     }
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # ---- Tầng 1 ----
+    # ---- Tầng 1 ---- (chỉ cần video, không cần audio)
     try:
-        info1 = retry(lambda: get_video_info(url, cfg.tier1_resolution, cfg), cfg)
+        info1 = retry(lambda: get_video_info(url, cfg, kind="video", max_height=cfg.tier1_resolution), cfg)
     except Exception as e:
         result["status"] = "error"
         result["errors"].append(f"tier1 extract_info: {e}")
@@ -404,9 +438,9 @@ def process_video(video_id: str, cfg: Config) -> dict:
         result["final_verdict"] = "reject_tier1"
         return result
 
-    # ---- Tầng 2 ----
+    # ---- Tầng 2 ---- (chỉ cần audio cho VAD, không cần video)
     try:
-        info2 = retry(lambda: get_video_info(url, cfg.tier2_resolution, cfg), cfg)
+        info2 = retry(lambda: get_video_info(url, cfg, kind="audio"), cfg)
     except Exception as e:
         result["errors"].append(f"tier2 extract_info: {e}")
         result["status"] = "error"
@@ -421,8 +455,8 @@ def process_video(video_id: str, cfg: Config) -> dict:
     speech_hits = 0
     for start in chosen_starts:
         start = min(start, max(0.0, duration - cfg.tier2_clip_duration - 0.1))
-        clip_path = os.path.join(tier2_dir, f"{start:.2f}.mp4")
-        wav_path = clip_path.replace(".mp4", ".wav")
+        clip_path = os.path.join(tier2_dir, f"{start:.2f}.m4a")
+        wav_path = clip_path.replace(".m4a", ".wav")
         sample_result = {"start": round(start, 2), "speech_ratio": None, "talking": False}
         try:
             retry(lambda s=start, p=clip_path: download_clip(info2, s, cfg.tier2_clip_duration, p), cfg)
