@@ -118,6 +118,8 @@ class Config:
     cookiefile: Optional[str] = None
     cookies_from_browser: Optional[str] = None   # vd: "chrome"
     player_clients: Optional[list] = None         # vd: ["web","android"] — để trống = mặc định yt-dlp
+    resume: bool = True                           # bỏ qua video đã xử lý "done" ở lần chạy trước
+    bot_check_stop_threshold: int = 8             # số lỗi "sign in to confirm" liên tiếp -> tự dừng batch
 
 
 # 6 điểm mốc 3D chuẩn (đơn vị mm, hệ toạ độ tuỳ ý) dùng để ước lượng headpose
@@ -140,6 +142,9 @@ LM_LEFT_MOUTH_CORNER = 61
 LM_RIGHT_MOUTH_CORNER = 291
 
 _thread_local = threading.local()
+
+# Cụm từ nhận diện lỗi "cookie chết"/bot-check của YouTube trong message lỗi
+BOT_CHECK_MARKERS = ("sign in to confirm", "cookies are no longer valid", "not a bot")
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +551,47 @@ def load_video_ids(path: str, column: str = "video_id") -> list:
         return video_ids
 
 
+def _is_bot_check_error(result: dict) -> bool:
+    text = " ".join(result.get("errors", [])).lower()
+    return any(marker in text for marker in BOT_CHECK_MARKERS)
+
+
 def run_batch(video_ids: list, cfg: Config) -> list:
     os.makedirs(cfg.frames_dir, exist_ok=True)
     os.makedirs(cfg.clips_dir, exist_ok=True)
     os.makedirs(cfg.meta_dir, exist_ok=True)
 
-    results = []
+    # ---- Resume: bỏ qua video đã xử lý xong ở lần chạy trước ----
+    # Chỉ skip nếu status="done" (accept/reject_tier1/reject_tier2); video từng
+    # bị lỗi ("error", thường do cookie chết) sẽ được thử lại ở lần chạy này.
+    pending_ids = video_ids
+    skipped_results = []
+    if cfg.resume:
+        pending_ids = []
+        for vid in video_ids:
+            meta_path = os.path.join(cfg.meta_dir, f"{vid}.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        prev = json.load(f)
+                    if prev.get("status") == "done":
+                        skipped_results.append(prev)
+                        continue
+                except Exception:
+                    pass  # meta hỏng -> xử lý lại cho chắc
+            pending_ids.append(vid)
+        if skipped_results:
+            logger.info(
+                "Resume: bỏ qua %d/%d video đã xử lý xong ở lần chạy trước.",
+                len(skipped_results), len(video_ids),
+            )
+
+    results = list(skipped_results)
+    consecutive_bot_check_errors = 0
+    stopped_early = False
+
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
-        futures = {executor.submit(process_video, vid, cfg): vid for vid in video_ids}
+        futures = {executor.submit(process_video, vid, cfg): vid for vid in pending_ids}
         for future in as_completed(futures):
             vid = futures[future]
             try:
@@ -572,6 +610,31 @@ def run_batch(video_ids: list, cfg: Config) -> list:
                 vid, result.get("final_verdict"), result.get("tier1_pass_ratio"),
                 len(result.get("errors", [])),
             )
+
+            # ---- Circuit breaker: cookie chết hàng loạt -> dừng sớm, đỡ tốn thời gian ----
+            if _is_bot_check_error(result):
+                consecutive_bot_check_errors += 1
+            else:
+                consecutive_bot_check_errors = 0
+
+            if consecutive_bot_check_errors >= cfg.bot_check_stop_threshold:
+                logger.critical(
+                    "Phát hiện %d lỗi 'cookie chết/bot-check' liên tiếp -> DỪNG SỚM batch. "
+                    "Xuất lại cookies.txt rồi chạy lại lệnh cũ (--resume mặc định bật, "
+                    "sẽ tự bỏ qua các video đã xong).",
+                    consecutive_bot_check_errors,
+                )
+                for f in futures:
+                    f.cancel()
+                stopped_early = True
+                break
+
+    if stopped_early:
+        logger.warning(
+            "Batch dừng sớm do cookie hết hạn. Đã xử lý %d/%d video (kể cả resume). "
+            "Chạy lại đúng lệnh cũ sau khi có cookies.txt mới.",
+            len(results), len(video_ids),
+        )
 
     with open(os.path.join(cfg.output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -615,6 +678,14 @@ def main():
         help="Chỉ định thủ công client yt-dlp dùng, cách nhau bởi dấu phẩy "
              "(vd: 'web,android'). Để trống = mặc định yt-dlp tự chọn (khuyến nghị).",
     )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Tắt resume — xử lý lại toàn bộ kể cả video đã có kết quả từ lần chạy trước.",
+    )
+    parser.add_argument(
+        "--bot-check-stop-threshold", type=int, default=8,
+        help="Số lỗi 'cookie chết/bot-check' liên tiếp trước khi tự dừng batch sớm.",
+    )
     args = parser.parse_args()
 
     cfg = Config(
@@ -632,6 +703,8 @@ def main():
         cookiefile=args.cookiefile,
         cookies_from_browser=args.cookies_from_browser,
         player_clients=[c.strip() for c in args.player_clients.split(",")] if args.player_clients else None,
+        resume=not args.no_resume,
+        bot_check_stop_threshold=args.bot_check_stop_threshold,
     )
     os.makedirs(cfg.output_dir, exist_ok=True)
 
