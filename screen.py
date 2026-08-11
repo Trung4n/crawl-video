@@ -16,7 +16,8 @@ Cài đặt:
     (cần có ffmpeg/ffprobe sẵn trong PATH)
 
 Chạy:
-    python video_screening_pipeline.py --ids-file video_ids.txt --workers 8
+    python video_screening_pipeline.py --ids-file video_ids.csv --workers 8
+    (file .csv cần có cột "video_id"; đổi tên cột bằng --ids-column nếu khác)
 
 Ghi chú quan trọng (kế thừa từ các bug đã gặp trước đó):
   - Không dùng yt_dlp.download() / download_sections — tự dựng lệnh ffmpeg
@@ -445,9 +446,20 @@ def process_video(video_id: str, cfg: Config) -> dict:
 # Batch runner
 # ---------------------------------------------------------------------------
 
-def load_video_ids(path: str) -> list:
-    with open(path, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+def load_video_ids(path: str, column: str = "video_id") -> list:
+    """Đọc danh sách video_id từ file .csv (cần có cột `column`, mặc định 'video_id')."""
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or column not in reader.fieldnames:
+            raise ValueError(
+                f"File CSV không có cột '{column}'. Các cột tìm thấy: {reader.fieldnames}"
+            )
+        video_ids = []
+        for row in reader:
+            vid = (row.get(column) or "").strip()
+            if vid:
+                video_ids.append(vid)
+        return video_ids
 
 
 def run_batch(video_ids: list, cfg: Config) -> list:
@@ -502,7 +514,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Sàng lọc dataset video YouTube (pipeline 2 tầng)")
-    parser.add_argument("--ids-file", required=True, help="File .txt, mỗi dòng 1 video_id")
+    parser.add_argument("--ids-file", required=True, help="File .csv có cột 'video_id'")
+    parser.add_argument("--ids-column", default="video_id", help="Tên cột chứa video_id trong file .csv")
     parser.add_argument("--output-dir", default="./screening_output")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--tier1-resolution", type=int, default=240)
@@ -532,7 +545,7 @@ def main():
     )
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    video_ids = load_video_ids(args.ids_file)
+    video_ids = load_video_ids(args.ids_file, args.ids_column)
     logger.info("Bắt đầu sàng lọc %d video với %d worker...", len(video_ids), cfg.max_workers)
     run_batch(video_ids, cfg)
 
