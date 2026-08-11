@@ -177,6 +177,10 @@ def get_video_info(url: str, cfg: Config, kind: str = "video", max_height: Optio
         "quiet": True,
         "no_warnings": True,
         "format": build_format_string(kind, max_height),
+        # tránh client android_vr/ios: các client này thường đòi PO token và
+        # trả URL yêu cầu header/context riêng, dễ gây 403 khi ffmpeg gọi lại
+        # bằng header chung chung -> ưu tiên android + web cho ổn định.
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     if cfg.cookiefile:
         ydl_opts["cookiefile"] = cfg.cookiefile
@@ -207,6 +211,15 @@ def compute_sample_starts(duration: float, cfg: Config) -> list:
     return [usable * i / (num_samples - 1) for i in range(num_samples)]
 
 
+def run_ffmpeg(cmd: list) -> None:
+    """Chạy ffmpeg và raise lỗi kèm vài dòng stderr cuối để dễ chẩn đoán
+    (403, URL hết hạn, codec lỗi, v.v.) thay vì chỉ báo exit code."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
+        raise RuntimeError(f"ffmpeg exit {proc.returncode}:\n{tail}")
+
+
 def extract_frame(info: dict, start: float, out_path: str) -> None:
     cmd = [
         "ffmpeg", "-y",
@@ -217,7 +230,7 @@ def extract_frame(info: dict, start: float, out_path: str) -> None:
         "-q:v", "2",
         out_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def download_clip(info: dict, start: float, duration: float, out_path: str) -> None:
@@ -230,7 +243,7 @@ def download_clip(info: dict, start: float, duration: float, out_path: str) -> N
         "-c", "copy",
         out_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def extract_wav(clip_path: str, wav_path: str) -> None:
@@ -240,7 +253,7 @@ def extract_wav(clip_path: str, wav_path: str) -> None:
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         wav_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def retry(fn, cfg: Config):
@@ -251,7 +264,7 @@ def retry(fn, cfg: Config):
         except Exception as e:  # noqa: BLE001 - muốn bắt mọi lỗi để retry/log
             last_exc = e
             if attempt < cfg.max_retries:
-                logger.warning("Lỗi (thử lại %d/%d): %s", attempt + 1, cfg.max_retries, e)
+                logger.warning("Lỗi (thử lại %d/%d):\n%s", attempt + 1, cfg.max_retries, e)
                 time.sleep(cfg.retry_backoff_sec * (attempt + 1))
     raise last_exc
 
