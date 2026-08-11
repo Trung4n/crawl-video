@@ -175,6 +175,7 @@ def get_video_info(url: str, cfg: Config, kind: str = "video", max_height: Optio
     """1 lần gọi extract_info duy nhất -> duration + direct_url + headers."""
     ydl_opts = {
         "quiet": True,
+        "no_warnings": True,
         "format": build_format_string(kind, max_height),
     }
     if cfg.cookiefile:
