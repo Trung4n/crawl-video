@@ -241,7 +241,7 @@ def compute_sample_starts(duration: float, cfg: Config) -> list:
     # margin lớn hơn 1.0s trước đây: mốc gần cuối video dễ rơi vào vùng
     # ffmpeg input-seek không tìm được frame nào để decode nữa (đặc biệt khi
     # `duration` chỉ là khai báo metadata, không phải duration thực đo được
-    # trên file local - xem probe_local_duration()) -> exit 0 nhưng output
+    # trên file local - xem probe_local_media_duration()) -> exit 0 nhưng output
     # rỗng. 2.5s đủ dư để né phần lớn trường hợp mà không ăn quá nhiều nội
     # dung hữu ích của video.
     margin = 2.5
@@ -271,27 +271,36 @@ def run_ffmpeg(cmd: list, cfg: Config, out_path: Optional[str] = None) -> None:
             raise RuntimeError(f"ffmpeg exit 0 nhưng output rỗng/quá nhỏ ({out_path}):\n{tail}")
 
 
-def probe_local_duration(path: str) -> Optional[float]:
-    """Lấy duration THẬT của file vừa tải về local, qua ffprobe.
+def probe_local_media_duration(path: str, stream_type: str = "v") -> Optional[float]:
+    """Lấy timestamp của PACKET CUỐI CÙNG thực sự có trong file, qua
+    `ffprobe ... packet=pts_time` - đáng tin hơn NHIỀU so với
+    `format=duration` (đã thử và KHÔNG ăn thua - xem lịch sử debug bên
+    dưới).
 
-    Lý do cần: `duration` từ yt-dlp (`info["duration"]`) là số YouTube khai
-    báo cho video, không nhất thiết khớp tuyệt đối với luồng video-only/
-    audio-only cụ thể đã tải về (chênh lệch có thể chỉ vài trăm ms tới vài
-    giây). Nếu cứ tin số khai báo để chọn mốc trích frame/clip, mốc gần
-    cuối có thể vượt quá số frame decode được thật trong file local ->
-    ffmpeg exit 0 nhưng output rỗng (xem `run_ffmpeg`). Dùng duration thật
-    đo trên file local (qua `min()` với số khai báo) để tính mốc sẽ an
-    toàn hơn hẳn."""
+    Lịch sử: bản đầu dùng `ffprobe -show_entries format=duration`, nhưng
+    con số này chỉ đọc lại trường Duration ghi sẵn trong HEADER container
+    Matroska - trường này do `ffmpeg -c copy` copy/ước lượng từ luồng gốc
+    lúc tải (thường theo manifest DASH của YouTube), KHÔNG phải số đo được
+    bằng cách quét thật các packet. Nếu Duration trong header bị "lạc quan"
+    hơn nội dung thực tế decode được (do bản chất DASH, hoặc tải bị cắt sớm
+    một chút nhưng vẫn đủ qua `min_valid_file_bytes`), format=duration vẫn
+    trả về con số sai y hệt -> vô dụng để tránh seek quá cuối.
+    `packet=pts_time` thì luôn phản ánh đúng nội dung THẬT có trong file.
+
+    stream_type: "v" (video) hoặc "a" (audio)."""
     proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
         capture_output=True, text=True,
     )
-    try:
-        val = float(proc.stdout.strip())
-        return val if val > 0 else None
-    except (ValueError, TypeError):
-        return None
+    values = []
+    for line in proc.stdout.strip().splitlines():
+        line = line.strip()
+        try:
+            values.append(float(line))
+        except ValueError:
+            continue  # dòng "N/A" hoặc rỗng
+    return max(values) if values else None
 
 
 def download_full_stream(info: dict, out_path: str, cfg: Config) -> None:
@@ -348,6 +357,34 @@ def retry(fn, cfg: Config):
             if attempt < cfg.max_retries:
                 logger.warning("Lỗi (thử lại %d/%d):\n%s", attempt + 1, cfg.max_retries, e)
                 time.sleep(cfg.retry_backoff_sec * (attempt + 1))
+    raise last_exc
+
+
+def run_with_time_backoff(fn, start: float, cfg: Config,
+                           offsets: tuple = (0.0, 1.0, 2.0, 4.0)) -> float:
+    """Gọi `fn(s)` (s = mốc thời gian) với các mốc LÙI DẦN so với `start`.
+
+    Khác với `retry()` (lặp lại y nguyên tham số - vô ích với lỗi TẤT ĐỊNH
+    như 'seek quá gần cuối stream thật', vì lần sau vẫn cùng input, cùng
+    lỗi): hàm này thử `start`, rồi nếu fail thì lùi 1s, 2s, 4s... Đây là
+    lưới an toàn CUỐI CÙNG cho các trường hợp việc ước lượng "cuối stream
+    thật" (qua `probe_local_media_duration`) vẫn chưa đủ margin (vd file có
+    keyframe interval lớn bất thường, hoặc vài packet cuối bị lỗi decode
+    dù có pts hợp lệ). Trả về mốc thời gian THỰC TẾ đã dùng để thành công,
+    để ghi log/kết quả đúng với frame/clip thật sự lấy được.
+    """
+    last_exc = None
+    for offset in offsets:
+        s = max(0.0, start - offset)
+        try:
+            fn(s)
+            return s
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if offset != offsets[-1]:
+                logger.warning(
+                    "Lỗi tại mốc %.2fs, lùi mốc thử lại (offset kế tiếp): %s", s, e
+                )
     raise last_exc
 
 
@@ -545,10 +582,9 @@ def process_video(video_id: str, cfg: Config) -> dict:
             result["final_verdict"] = "reject_tier1"
             return result
 
-        # Duration thật của file video-only vừa tải (có thể lệch so với
-        # metadata YouTube) -> dùng số NHỎ HƠN để tính mốc, tránh seek vượt
-        # quá số frame thực sự decode được (xem probe_local_duration()).
-        local_video_duration = probe_local_duration(local_video_path)
+        # Mốc pts packet cuối thật của video-only vừa tải (KHÔNG dùng Duration
+        # trong header - xem lý do trong docstring probe_local_media_duration).
+        local_video_duration = probe_local_media_duration(local_video_path, "v")
         if local_video_duration is not None:
             duration = min(duration, local_video_duration)
             result["duration"] = duration
@@ -562,13 +598,17 @@ def process_video(video_id: str, cfg: Config) -> dict:
             frame_path = os.path.join(tier1_dir, f"{start:.2f}.jpg")
             sample_result = {"start": round(start, 2), "face_found": False, "headpose_ok": False}
             try:
-                retry(lambda s=start, p=frame_path: extract_frame_local(local_video_path, s, p, cfg), cfg)
+                actual_start = run_with_time_backoff(
+                    lambda ss: extract_frame_local(local_video_path, ss, frame_path, cfg),
+                    start, cfg,
+                )
+                sample_result["start"] = round(actual_start, 2)
                 sample_result.update(analyze_frame(frame_path, cfg))
             except Exception as e:
                 result["errors"].append(f"tier1 frame @ {start:.2f}s: {e}")
             result["tier1_samples"].append(sample_result)
             if sample_result.get("face_found") and sample_result.get("headpose_ok"):
-                passed_starts.append((start, sample_result.get("headpose_score", 0.0)))
+                passed_starts.append((sample_result["start"], sample_result.get("headpose_score", 0.0)))
         # local_video_path sẽ tự bị xoá khi thoát khỏi `with tempfile.TemporaryDirectory`
 
         n_total = len(starts)
@@ -598,10 +638,9 @@ def process_video(video_id: str, cfg: Config) -> dict:
             result["final_verdict"] = "reject_tier2"
             return result
 
-        # Cũng như tầng 1: luồng audio-only tải về có thể có duration thực
-        # ngắn hơn `duration` (vốn lấy từ tier 1/metadata YouTube) -> probe
-        # lại để không clamp mốc cắt clip dựa trên số liệu sai.
-        local_audio_duration = probe_local_duration(local_audio_path) or duration
+        # Mốc pts packet audio cuối thật (tương tự tầng 1 - KHÔNG dùng
+        # Duration trong header, xem probe_local_media_duration()).
+        local_audio_duration = probe_local_media_duration(local_audio_path, "a") or duration
         clip_duration_bound = min(duration, local_audio_duration)
 
         passed_starts.sort(key=lambda x: -x[1])  # ưu tiên mốc "chính diện" nhất
@@ -616,12 +655,13 @@ def process_video(video_id: str, cfg: Config) -> dict:
             wav_path = os.path.join(tier2_dir, f"{start:.2f}.wav")
             sample_result = {"start": round(start, 2), "speech_ratio": None, "talking": False}
             try:
-                retry(
-                    lambda s=start, p=wav_path: extract_wav_segment_local(
-                        local_audio_path, s, cfg.tier2_clip_duration, p, cfg
+                actual_start = run_with_time_backoff(
+                    lambda ss: extract_wav_segment_local(
+                        local_audio_path, ss, cfg.tier2_clip_duration, wav_path, cfg
                     ),
-                    cfg,
+                    start, cfg,
                 )
+                sample_result["start"] = round(actual_start, 2)
                 speech_ratio = vad_speech_ratio(wav_path, cfg)
                 sample_result["speech_ratio"] = round(speech_ratio, 3)
                 sample_result["talking"] = speech_ratio >= cfg.tier2_min_speech_ratio
