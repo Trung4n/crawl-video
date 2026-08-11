@@ -1,15 +1,16 @@
 """
 Pipeline 2 tầng để sàng lọc dataset video YouTube (~3000 video).
 
-Tầng 1 (rẻ):  trích 1 frame tĩnh tại nhiều mốc thời gian rải đều trong video
-              (ffmpeg -vframes 1, gần như tức thì sau khi seek) -> chạy face
-              detection + headpose. Video không đạt bị loại ngay, không tốn
-              băng thông tải clip.
+Tầng 1 (rẻ):  tải TOÀN BỘ 1 luồng video-only ở độ phân giải thấp (mặc định
+              240p) về local, rồi trích frame tĩnh tại nhiều mốc thời gian
+              rải đều trên file local đó -> chạy face detection + headpose.
+              Video không đạt bị loại ngay, không tốn thêm bước nào nữa.
 
 Tầng 2 (đắt hơn, chỉ chạy trên video đã pass tầng 1):
-              tải 2-3 clip ngắn (mặc định 3.5s) có audio tại các mốc "chính
-              diện" nhất từ tầng 1 -> tách audio -> chạy VAD (webrtcvad) để
-              ước lượng tỉ lệ có giọng nói -> quyết định "đang nói chuyện".
+              tải TOÀN BỘ luồng audio-only về local, cắt 2-3 đoạn ngắn
+              (mặc định 3.5s) tại các mốc "chính diện" nhất từ tầng 1 ->
+              chạy VAD (webrtcvad) để ước lượng tỉ lệ có giọng nói -> quyết
+              định "đang nói chuyện".
 
 Cài đặt:
     pip install yt-dlp opencv-python-headless mediapipe numpy webrtcvad
@@ -19,33 +20,63 @@ Chạy:
     python video_screening_pipeline.py --ids-file video_ids.csv --workers 8
     (file .csv cần có cột "video_id"; đổi tên cột bằng --ids-column nếu khác)
 
-Ghi chú quan trọng (kế thừa từ các bug đã gặp trước đó):
-  - Không dùng yt_dlp.download() / download_sections — tự dựng lệnh ffmpeg
-    tường minh, "-ss" đặt TRƯỚC "-i" để seek nhanh qua HTTP range.
-  - Dùng format progressive (1 luồng, có cả video+audio) thay vì
-    bestvideo+bestaudio tách rời — audio DASH riêng seek rất chậm.
-  - "-c copy" khi tải clip: nhanh nhưng snap về keyframe gần nhất, chấp nhận
-    được cho mục đích sàng lọc.
-  - Luôn gắn http_headers từ yt-dlp khi gọi ffmpeg trực tiếp để tránh lỗi 403.
-  - URL trực tiếp chỉ có hạn dùng vài giờ -> lấy info và xử lý liền cho từng
+=== LỊCH SỬ BUG & LÝ DO KIẾN TRÚC HIỆN TẠI ===
+
+Bản trước dùng `ffmpeg -ss <t> -i <url_googlevideo_truc_tiep>` để seek THẲNG
+trên URL remote (input seeking). Vấn đề: khi seek theo cách này trên URL CDN
+của Google, ffmpeg không luôn gửi đúng HTTP Range header mà CDN kỳ vọng
+(xem yt-dlp issue #11895: "ffmpeg fails but downloader succeeds ... i.e.
+download_ranges fails but entire file downloads"). Hậu quả quan sát được:
+ffmpeg thoát với exit code 0 (KHÔNG raise lỗi) nhưng file output rỗng/hỏng
+-> toàn bộ video bị chấm "reject_tier1" hàng loạt dù `errors=0`, khiến bug
+gần như vô hình trong log.
+
+=> Kiến trúc mới: với MỖI video, tải nguyên luồng (video-only cho tầng 1,
+   audio-only cho tầng 2 - luồng đã chọn độ phân giải/bitrate thấp nên khá
+   nhẹ) về 1 thư mục tạm cục bộ (`tempfile.TemporaryDirectory`, tự dọn dẹp
+   khi xong), sau đó MỌI thao tác seek/cắt (`-ss`, `-t`) đều chạy trên file
+   LOCAL - vốn luôn nhanh và không phụ thuộc vào việc CDN có xử lý đúng
+   Range header hay không. Đổi lại tốn băng thông hơn 1 chút (tải cả luồng
+   thay vì chỉ vài giây quanh mốc cần) - đây là đánh đổi được người dùng
+   chấp nhận (chậm hơn, chính xác/ổn định hơn).
+
+   Đồng thời `run_ffmpeg()` giờ LUÔN kiểm tra file output có tồn tại và đủ
+   lớn hay không (không chỉ dựa vào exit code) - nếu ffmpeg từng lặp lại
+   kiểu lỗi "exit 0 nhưng file rỗng" ở bất kỳ bước nào khác trong tương lai,
+   nó sẽ được raise thành lỗi thật và xuất hiện rõ trong `result["errors"]`
+   thay vì bị nuốt âm thầm.
+
+LƯU Ý QUAN TRỌNG (kế thừa từ các bug trước đó, vẫn còn giá trị):
+  - "-c copy" khi tải nguyên luồng: nhanh, không re-encode; dùng container
+    .mkv (video) / .mka (audio) vì Matroska copy được hầu hết mọi codec
+    (h264/vp9/av1, aac/opus/vorbis...) mà không lo lỗi container-codec
+    không tương thích.
+  - Luôn gắn http_headers từ yt-dlp khi gọi ffmpeg trực tiếp để tránh 403 -
+    nhưng giờ chỉ cần cho ĐÚNG 1 lần tải nguyên luồng mỗi tầng, không cần
+    gắn lại cho từng lần seek/cắt cục bộ nữa.
+  - URL trực tiếp chỉ có hạn dùng vài giờ -> lấy info và tải liền cho từng
     video trong cùng 1 worker, không tách rời quá xa về thời gian.
-  - Tier 1 chỉ cần VIDEO (trích frame), tier 2 chỉ cần AUDIO (VAD) -> mỗi
-    tầng tự extract_info với format riêng (`kind="video"` / `kind="audio"`),
-    tránh đòi progressive stream (video+audio chung 1 file) vốn ngày càng
-    hiếm trên YouTube ở các mốc phân giải thấp và hay gây lỗi
-    "Requested format is not available". Trong mỗi tầng vẫn chỉ 1 lần
-    extract_info (duration + direct_url + headers gộp chung).
+  - Tier 1 chỉ cần VIDEO, tier 2 chỉ cần AUDIO -> mỗi tầng tự extract_info
+    với format riêng (`kind="video"` / `kind="audio"`), tránh đòi
+    progressive stream (video+audio chung 1 file) vốn ngày càng hiếm trên
+    YouTube ở các mốc phân giải thấp.
   - Nếu vẫn gặp nhiều lỗi format/extraction, cân nhắc cài 1 JS runtime
-    (vd `deno`) để yt-dlp giải mã signature YouTube ổn định hơn — xem
+    (vd `deno`) để yt-dlp giải mã signature YouTube ổn định hơn - xem
     cảnh báo "No supported JavaScript runtime" khi chạy.
+
+GIỚI HẠN CÒN LẠI (không có pipeline nào "không bao giờ lỗi"):
+  - Vẫn có thể gặp lỗi mạng thoáng qua (timeout, 403 tạm thời), video bị
+    riêng tư/xoá/giới hạn tuổi, hoặc YouTube thay đổi cơ chế chống bot.
+    `retry()` + circuit breaker (`bot_check_stop_threshold`) xử lý phần
+    lớn các trường hợp này, nhưng không thể triệt tiêu 100%. Điểm khác
+    biệt quan trọng: giờ các lỗi này sẽ xuất hiện THẬT trong
+    `result["errors"]` thay vì bị nuốt âm thầm thành "reject_tier1" sai.
 
 Điểm cần xác nhận / dễ đổi:
   - Cách xác nhận "đang nói chuyện" ở tầng 2 hiện dùng VAD trên audio-only
-    (đơn giản, nhẹ, không cần tải video). Nếu muốn chuyển sang lip-movement
-    hoặc SyncNet (cần cả video), đổi lời gọi `get_video_info(url, cfg,
-    kind="audio")` ở tier 2 thành `kind="progressive"` (hoặc tải riêng
-    video+audio rồi mux bằng `-map`), rồi thay `vad_speech_ratio()` bằng
-    hàm phân tích video mới.
+    (đơn giản, nhẹ). Nếu muốn chuyển sang lip-movement/SyncNet (cần cả
+    video), tải thêm luồng video ở tầng 2 tương tự tầng 1 rồi thay
+    `vad_speech_ratio()` bằng hàm phân tích video mới.
 """
 
 import os
@@ -54,6 +85,7 @@ import json
 import time
 import wave
 import logging
+import tempfile
 import threading
 import contextlib
 import subprocess
@@ -105,8 +137,7 @@ class Config:
     tier1_min_pass_ratio: float = 0.5      # >=50% mốc phải có mặt + headpose ổn để pass tầng 1
 
     # Tầng 2 — xác nhận nói chuyện
-    tier2_resolution: int = 360
-    tier2_clip_duration: float = 3.5       # giây (3-4s), đủ cho VAD/lip-motion đơn giản
+    tier2_clip_duration: float = 3.5       # giây (3-4s), đủ cho VAD đơn giản
     tier2_num_clips: int = 3               # chỉ lấy top-N mốc "chính diện" nhất từ tầng 1
     tier2_min_speech_ratio: float = 0.3    # tỉ lệ frame VAD phát hiện speech để coi là "có nói"
     tier2_vad_aggressiveness: int = 2      # 0 (lỏng) .. 3 (chặt)
@@ -115,6 +146,7 @@ class Config:
     max_workers: int = 8                   # không nên cao hơn ~10, dễ bị YouTube rate-limit
     max_retries: int = 2
     retry_backoff_sec: float = 3.0
+    min_valid_file_bytes: int = 1024       # file output nhỏ hơn ngưỡng này bị coi là hỏng/rỗng
     cookiefile: Optional[str] = None
     cookies_from_browser: Optional[str] = None   # vd: "chrome"
     player_clients: Optional[list] = None         # vd: ["web","android"] — để trống = mặc định yt-dlp
@@ -159,13 +191,8 @@ def build_format_string(kind: str, max_height: Optional[int] = None) -> str:
     """
     Chuỗi format cho yt-dlp, tuỳ theo thứ cần lấy:
       - "video": chỉ cần luồng video (dùng cho tier 1 - trích frame, không cần audio).
-        Progressive stream (video+audio) ngày càng hiếm ở các mốc thấp, nên ưu tiên
-        bestvideo (thường là DASH, vẫn seek nhanh qua HTTP range như bình thường).
       - "audio": chỉ cần luồng audio (dùng cho tier 2 - VAD, không cần video).
-      - "progressive": cần 1 file có cả video+audio (dự phòng nếu sau này đổi sang
-        phương pháp cần video ở tier 2, ví dụ lip-movement).
-    Luôn có chuỗi fallback "/best" ở cuối để giảm tỉ lệ "format not available"
-    trên các video không còn giữ format ở độ phân giải mong muốn.
+    Luôn có chuỗi fallback "/best" ở cuối để giảm tỉ lệ "format not available".
     """
     h = max_height or 99999
     if kind == "video":
@@ -175,14 +202,10 @@ def build_format_string(kind: str, max_height: Optional[int] = None) -> str:
         )
     if kind == "audio":
         return "bestaudio[ext=m4a]/bestaudio/best"
-    # progressive
-    return (
-        f"best[height<={h}][ext=mp4][acodec!=none][vcodec!=none]/"
-        f"best[height<={h}][acodec!=none][vcodec!=none]/best[height<={h}]/best"
-    )
+    raise ValueError(f"kind không hợp lệ: {kind!r}")
 
 
-def get_video_info(url: str, cfg: Config, kind: str = "video", max_height: Optional[int] = None) -> dict:
+def get_video_info(url: str, cfg: Config, kind: str, max_height: Optional[int] = None) -> dict:
     """1 lần gọi extract_info duy nhất -> duration + direct_url + headers."""
     ydl_opts = {
         "quiet": True,
@@ -224,49 +247,66 @@ def compute_sample_starts(duration: float, cfg: Config) -> list:
     return [usable * i / (num_samples - 1) for i in range(num_samples)]
 
 
-def run_ffmpeg(cmd: list) -> None:
-    """Chạy ffmpeg và raise lỗi kèm vài dòng stderr cuối để dễ chẩn đoán
-    (403, URL hết hạn, codec lỗi, v.v.) thay vì chỉ báo exit code."""
+def run_ffmpeg(cmd: list, cfg: Config, out_path: Optional[str] = None) -> None:
+    """Chạy ffmpeg và raise lỗi kèm vài dòng stderr cuối để dễ chẩn đoán.
+
+    QUAN TRỌNG: exit code 0 KHÔNG đảm bảo output hợp lệ (từng gặp trường hợp
+    ffmpeg seek trên URL remote trả về exit 0 nhưng file rỗng/hỏng). Nếu
+    `out_path` được truyền vào, hàm sẽ tự kiểm tra file có tồn tại và đủ
+    lớn hay không, raise lỗi thật nếu không - để không còn lỗi nào bị nuốt
+    âm thầm."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
         raise RuntimeError(f"ffmpeg exit {proc.returncode}:\n{tail}")
+    if out_path is not None:
+        if not os.path.exists(out_path) or os.path.getsize(out_path) < cfg.min_valid_file_bytes:
+            tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
+            raise RuntimeError(f"ffmpeg exit 0 nhưng output rỗng/quá nhỏ ({out_path}):\n{tail}")
 
 
-def extract_frame(info: dict, start: float, out_path: str) -> None:
+def download_full_stream(info: dict, out_path: str, cfg: Config) -> None:
+    """Tải TOÀN BỘ 1 luồng (video-only hoặc audio-only) về local bằng GET
+    tuần tự, KHÔNG seek -> né hẳn lỗi 'ffmpeg -ss trên URL googlevideo không
+    gửi đúng Range header, CDN trả về rỗng/hỏng âm thầm' (yt-dlp #11895)."""
     cmd = [
         "ffmpeg", "-y",
         "-headers", info["header_str"],
-        "-ss", f"{start:.2f}",
         "-i", info["direct_url"],
+        "-c", "copy",
+        out_path,
+    ]
+    run_ffmpeg(cmd, cfg, out_path=out_path)
+
+
+def extract_frame_local(local_path: str, start: float, out_path: str, cfg: Config) -> None:
+    """Seek + trích frame trên file LOCAL -> luôn nhanh & tin cậy, không phụ thuộc CDN."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", local_path,
         "-vframes", "1",
         "-q:v", "2",
         out_path,
     ]
-    run_ffmpeg(cmd)
+    run_ffmpeg(cmd, cfg, out_path=out_path)
 
 
-def download_clip(info: dict, start: float, duration: float, out_path: str) -> None:
+def extract_wav_segment_local(local_audio_path: str, start: float, duration: float,
+                               out_wav_path: str, cfg: Config) -> None:
+    """Cắt 1 đoạn từ file audio LOCAL và transcode thẳng sang WAV 16kHz mono
+    (đủ cho webrtcvad) trong 1 lệnh ffmpeg duy nhất - không cần file trung
+    gian, không lo codec/container không tương thích vì transcode chứ
+    không stream-copy."""
     cmd = [
         "ffmpeg", "-y",
-        "-headers", info["header_str"],
         "-ss", f"{start:.2f}",
-        "-i", info["direct_url"],
+        "-i", local_audio_path,
         "-t", f"{duration}",
-        "-c", "copy",
-        out_path,
-    ]
-    run_ffmpeg(cmd)
-
-
-def extract_wav(clip_path: str, wav_path: str) -> None:
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", clip_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        wav_path,
+        out_wav_path,
     ]
-    run_ffmpeg(cmd)
+    run_ffmpeg(cmd, cfg, out_path=out_wav_path)
 
 
 def retry(fn, cfg: Config):
@@ -405,7 +445,7 @@ def analyze_frame(frame_path: str, cfg: Config) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tầng 2 — VAD trên audio của clip ngắn
+# Tầng 2 — VAD trên audio của đoạn ngắn
 # ---------------------------------------------------------------------------
 
 def vad_speech_ratio(wav_path: str, cfg: Config, frame_ms: int = 30) -> float:
@@ -455,80 +495,103 @@ def process_video(video_id: str, cfg: Config) -> dict:
     }
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # ---- Tầng 1 ---- (chỉ cần video, không cần audio)
-    try:
-        info1 = retry(lambda: get_video_info(url, cfg, kind="video", max_height=cfg.tier1_resolution), cfg)
-    except Exception as e:
-        result["status"] = "error"
-        result["errors"].append(f"tier1 extract_info: {e}")
-        return result
-
-    duration = info1["duration"]
-    result["duration"] = duration
-    starts = compute_sample_starts(duration, cfg)
-
-    tier1_dir = os.path.join(cfg.frames_dir, video_id)
-    os.makedirs(tier1_dir, exist_ok=True)
-
-    passed_starts = []  # [(start, headpose_score), ...]
-    for start in starts:
-        frame_path = os.path.join(tier1_dir, f"{start:.2f}.jpg")
-        sample_result = {"start": round(start, 2), "face_found": False, "headpose_ok": False}
+    with tempfile.TemporaryDirectory(prefix=f"yt_{video_id}_") as tmp_dir:
+        # ---- Tầng 1 ---- (chỉ cần video, không cần audio)
         try:
-            retry(lambda s=start, p=frame_path: extract_frame(info1, s, p), cfg)
-            sample_result.update(analyze_frame(frame_path, cfg))
+            info1 = retry(lambda: get_video_info(url, cfg, kind="video", max_height=cfg.tier1_resolution), cfg)
         except Exception as e:
-            result["errors"].append(f"tier1 frame @ {start:.2f}s: {e}")
-        result["tier1_samples"].append(sample_result)
-        if sample_result.get("face_found") and sample_result.get("headpose_ok"):
-            passed_starts.append((start, sample_result.get("headpose_score", 0.0)))
+            result["status"] = "error"
+            result["errors"].append(f"tier1 extract_info: {e}")
+            return result
 
-    n_total = len(starts)
-    pass_ratio = len(passed_starts) / n_total if n_total else 0.0
-    result["tier1_pass_ratio"] = round(pass_ratio, 3)
-    result["tier1_pass"] = pass_ratio >= cfg.tier1_min_pass_ratio
+        duration = info1["duration"]
+        result["duration"] = duration
 
-    if not result["tier1_pass"]:
+        local_video_path = os.path.join(tmp_dir, "video.mkv")
+        try:
+            retry(lambda: download_full_stream(info1, local_video_path, cfg), cfg)
+        except Exception as e:
+            result["errors"].append(f"tier1 download stream: {e}")
+            result["status"] = "done"
+            result["final_verdict"] = "reject_tier1"
+            return result
+
+        starts = compute_sample_starts(duration, cfg)
+        tier1_dir = os.path.join(cfg.frames_dir, video_id)
+        os.makedirs(tier1_dir, exist_ok=True)
+
+        passed_starts = []  # [(start, headpose_score), ...]
+        for start in starts:
+            frame_path = os.path.join(tier1_dir, f"{start:.2f}.jpg")
+            sample_result = {"start": round(start, 2), "face_found": False, "headpose_ok": False}
+            try:
+                retry(lambda s=start, p=frame_path: extract_frame_local(local_video_path, s, p, cfg), cfg)
+                sample_result.update(analyze_frame(frame_path, cfg))
+            except Exception as e:
+                result["errors"].append(f"tier1 frame @ {start:.2f}s: {e}")
+            result["tier1_samples"].append(sample_result)
+            if sample_result.get("face_found") and sample_result.get("headpose_ok"):
+                passed_starts.append((start, sample_result.get("headpose_score", 0.0)))
+        # local_video_path sẽ tự bị xoá khi thoát khỏi `with tempfile.TemporaryDirectory`
+
+        n_total = len(starts)
+        pass_ratio = len(passed_starts) / n_total if n_total else 0.0
+        result["tier1_pass_ratio"] = round(pass_ratio, 3)
+        result["tier1_pass"] = pass_ratio >= cfg.tier1_min_pass_ratio
+
+        if not result["tier1_pass"]:
+            result["status"] = "done"
+            result["final_verdict"] = "reject_tier1"
+            return result
+
+        # ---- Tầng 2 ---- (chỉ cần audio cho VAD, không cần video)
+        try:
+            info2 = retry(lambda: get_video_info(url, cfg, kind="audio"), cfg)
+        except Exception as e:
+            result["errors"].append(f"tier2 extract_info: {e}")
+            result["status"] = "error"
+            return result
+
+        local_audio_path = os.path.join(tmp_dir, "audio.mka")
+        try:
+            retry(lambda: download_full_stream(info2, local_audio_path, cfg), cfg)
+        except Exception as e:
+            result["errors"].append(f"tier2 download stream: {e}")
+            result["status"] = "done"
+            result["final_verdict"] = "reject_tier2"
+            return result
+
+        passed_starts.sort(key=lambda x: -x[1])  # ưu tiên mốc "chính diện" nhất
+        chosen_starts = [s for s, _ in passed_starts[: cfg.tier2_num_clips]]
+
+        tier2_dir = os.path.join(cfg.clips_dir, video_id)
+        os.makedirs(tier2_dir, exist_ok=True)
+
+        speech_hits = 0
+        for start in chosen_starts:
+            start = min(start, max(0.0, duration - cfg.tier2_clip_duration - 0.1))
+            wav_path = os.path.join(tier2_dir, f"{start:.2f}.wav")
+            sample_result = {"start": round(start, 2), "speech_ratio": None, "talking": False}
+            try:
+                retry(
+                    lambda s=start, p=wav_path: extract_wav_segment_local(
+                        local_audio_path, s, cfg.tier2_clip_duration, p, cfg
+                    ),
+                    cfg,
+                )
+                speech_ratio = vad_speech_ratio(wav_path, cfg)
+                sample_result["speech_ratio"] = round(speech_ratio, 3)
+                sample_result["talking"] = speech_ratio >= cfg.tier2_min_speech_ratio
+                if sample_result["talking"]:
+                    speech_hits += 1
+            except Exception as e:
+                result["errors"].append(f"tier2 clip @ {start:.2f}s: {e}")
+            result["tier2_samples"].append(sample_result)
+
+        result["tier2_pass"] = speech_hits > 0
         result["status"] = "done"
-        result["final_verdict"] = "reject_tier1"
+        result["final_verdict"] = "accept" if result["tier2_pass"] else "reject_tier2"
         return result
-
-    # ---- Tầng 2 ---- (chỉ cần audio cho VAD, không cần video)
-    try:
-        info2 = retry(lambda: get_video_info(url, cfg, kind="audio"), cfg)
-    except Exception as e:
-        result["errors"].append(f"tier2 extract_info: {e}")
-        result["status"] = "error"
-        return result
-
-    passed_starts.sort(key=lambda x: -x[1])  # ưu tiên mốc "chính diện" nhất
-    chosen_starts = [s for s, _ in passed_starts[: cfg.tier2_num_clips]]
-
-    tier2_dir = os.path.join(cfg.clips_dir, video_id)
-    os.makedirs(tier2_dir, exist_ok=True)
-
-    speech_hits = 0
-    for start in chosen_starts:
-        start = min(start, max(0.0, duration - cfg.tier2_clip_duration - 0.1))
-        clip_path = os.path.join(tier2_dir, f"{start:.2f}.m4a")
-        wav_path = clip_path.replace(".m4a", ".wav")
-        sample_result = {"start": round(start, 2), "speech_ratio": None, "talking": False}
-        try:
-            retry(lambda s=start, p=clip_path: download_clip(info2, s, cfg.tier2_clip_duration, p), cfg)
-            extract_wav(clip_path, wav_path)
-            speech_ratio = vad_speech_ratio(wav_path, cfg)
-            sample_result["speech_ratio"] = round(speech_ratio, 3)
-            sample_result["talking"] = speech_ratio >= cfg.tier2_min_speech_ratio
-            if sample_result["talking"]:
-                speech_hits += 1
-        except Exception as e:
-            result["errors"].append(f"tier2 clip @ {start:.2f}s: {e}")
-        result["tier2_samples"].append(sample_result)
-
-    result["tier2_pass"] = speech_hits > 0
-    result["status"] = "done"
-    result["final_verdict"] = "accept" if result["tier2_pass"] else "reject_tier2"
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +720,27 @@ def run_batch(video_ids: list, cfg: Config) -> list:
     return results
 
 
+def clear_suspect_meta(cfg: Config) -> int:
+    """Helper dọn dẹp: xoá các file meta có 'chữ ký' của bug cũ (silent-fail
+    khi seek trên URL remote) - tier1_pass_ratio=0.0 NHƯNG không ghi nhận lỗi
+    nào (errors rỗng). Các video này sẽ được xử lý lại ở lần chạy tiếp theo
+    nhờ cơ chế resume. KHÔNG đụng tới video đã bị reject/accept hợp lệ có
+    kèm lỗi thật hoặc pass_ratio > 0."""
+    import glob
+    removed = 0
+    for path in glob.glob(os.path.join(cfg.meta_dir, "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                r = json.load(f)
+        except Exception:
+            continue
+        if r.get("tier1_pass_ratio") == 0.0 and len(r.get("errors", [])) == 0:
+            os.remove(path)
+            removed += 1
+    logger.info("Đã xoá %d meta nghi bị lỗi silent-fail cũ, sẽ được xử lý lại.", removed)
+    return removed
+
+
 def main():
     import argparse
 
@@ -666,7 +750,6 @@ def main():
     parser.add_argument("--output-dir", default="./screening_output")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--tier1-resolution", type=int, default=240)
-    parser.add_argument("--tier2-resolution", type=int, default=360)
     parser.add_argument("--min-samples", type=int, default=3)
     parser.add_argument("--max-samples", type=int, default=10)
     parser.add_argument("--tier1-min-pass-ratio", type=float, default=0.5)
@@ -683,6 +766,11 @@ def main():
         help="Tắt resume — xử lý lại toàn bộ kể cả video đã có kết quả từ lần chạy trước.",
     )
     parser.add_argument(
+        "--clear-suspect-meta", action="store_true",
+        help="Trước khi chạy, xoá các meta nghi bị lỗi silent-fail của bug cũ "
+             "(tier1_pass_ratio=0.0 và errors rỗng) để chúng được xử lý lại.",
+    )
+    parser.add_argument(
         "--bot-check-stop-threshold", type=int, default=8,
         help="Số lỗi 'cookie chết/bot-check' liên tiếp trước khi tự dừng batch sớm.",
     )
@@ -694,7 +782,6 @@ def main():
         clips_dir=os.path.join(args.output_dir, "clips"),
         meta_dir=os.path.join(args.output_dir, "meta"),
         tier1_resolution=args.tier1_resolution,
-        tier2_resolution=args.tier2_resolution,
         tier1_min_samples=args.min_samples,
         tier1_max_samples=args.max_samples,
         tier1_min_pass_ratio=args.tier1_min_pass_ratio,
@@ -707,6 +794,10 @@ def main():
         bot_check_stop_threshold=args.bot_check_stop_threshold,
     )
     os.makedirs(cfg.output_dir, exist_ok=True)
+    os.makedirs(cfg.meta_dir, exist_ok=True)
+
+    if args.clear_suspect_meta:
+        clear_suspect_meta(cfg)
 
     video_ids = load_video_ids(args.ids_file, args.ids_column)
     logger.info("Bắt đầu sàng lọc %d video với %d worker...", len(video_ids), cfg.max_workers)
