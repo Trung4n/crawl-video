@@ -238,7 +238,13 @@ def compute_sample_starts(duration: float, cfg: Config) -> list:
     num_samples = round(minutes / cfg.tier1_minutes_per_sample)
     num_samples = max(cfg.tier1_min_samples, min(cfg.tier1_max_samples, num_samples))
 
-    margin = 1.0
+    # margin lớn hơn 1.0s trước đây: mốc gần cuối video dễ rơi vào vùng
+    # ffmpeg input-seek không tìm được frame nào để decode nữa (đặc biệt khi
+    # `duration` chỉ là khai báo metadata, không phải duration thực đo được
+    # trên file local - xem probe_local_duration()) -> exit 0 nhưng output
+    # rỗng. 2.5s đủ dư để né phần lớn trường hợp mà không ăn quá nhiều nội
+    # dung hữu ích của video.
+    margin = 2.5
     if duration <= margin * 2:
         return [0.0]
     usable = duration - margin
@@ -263,6 +269,29 @@ def run_ffmpeg(cmd: list, cfg: Config, out_path: Optional[str] = None) -> None:
         if not os.path.exists(out_path) or os.path.getsize(out_path) < cfg.min_valid_file_bytes:
             tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
             raise RuntimeError(f"ffmpeg exit 0 nhưng output rỗng/quá nhỏ ({out_path}):\n{tail}")
+
+
+def probe_local_duration(path: str) -> Optional[float]:
+    """Lấy duration THẬT của file vừa tải về local, qua ffprobe.
+
+    Lý do cần: `duration` từ yt-dlp (`info["duration"]`) là số YouTube khai
+    báo cho video, không nhất thiết khớp tuyệt đối với luồng video-only/
+    audio-only cụ thể đã tải về (chênh lệch có thể chỉ vài trăm ms tới vài
+    giây). Nếu cứ tin số khai báo để chọn mốc trích frame/clip, mốc gần
+    cuối có thể vượt quá số frame decode được thật trong file local ->
+    ffmpeg exit 0 nhưng output rỗng (xem `run_ffmpeg`). Dùng duration thật
+    đo trên file local (qua `min()` với số khai báo) để tính mốc sẽ an
+    toàn hơn hẳn."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    try:
+        val = float(proc.stdout.strip())
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def download_full_stream(info: dict, out_path: str, cfg: Config) -> None:
@@ -516,6 +545,14 @@ def process_video(video_id: str, cfg: Config) -> dict:
             result["final_verdict"] = "reject_tier1"
             return result
 
+        # Duration thật của file video-only vừa tải (có thể lệch so với
+        # metadata YouTube) -> dùng số NHỎ HƠN để tính mốc, tránh seek vượt
+        # quá số frame thực sự decode được (xem probe_local_duration()).
+        local_video_duration = probe_local_duration(local_video_path)
+        if local_video_duration is not None:
+            duration = min(duration, local_video_duration)
+            result["duration"] = duration
+
         starts = compute_sample_starts(duration, cfg)
         tier1_dir = os.path.join(cfg.frames_dir, video_id)
         os.makedirs(tier1_dir, exist_ok=True)
@@ -561,6 +598,12 @@ def process_video(video_id: str, cfg: Config) -> dict:
             result["final_verdict"] = "reject_tier2"
             return result
 
+        # Cũng như tầng 1: luồng audio-only tải về có thể có duration thực
+        # ngắn hơn `duration` (vốn lấy từ tier 1/metadata YouTube) -> probe
+        # lại để không clamp mốc cắt clip dựa trên số liệu sai.
+        local_audio_duration = probe_local_duration(local_audio_path) or duration
+        clip_duration_bound = min(duration, local_audio_duration)
+
         passed_starts.sort(key=lambda x: -x[1])  # ưu tiên mốc "chính diện" nhất
         chosen_starts = [s for s, _ in passed_starts[: cfg.tier2_num_clips]]
 
@@ -569,7 +612,7 @@ def process_video(video_id: str, cfg: Config) -> dict:
 
         speech_hits = 0
         for start in chosen_starts:
-            start = min(start, max(0.0, duration - cfg.tier2_clip_duration - 0.1))
+            start = min(start, max(0.0, clip_duration_bound - cfg.tier2_clip_duration - 0.5))
             wav_path = os.path.join(tier2_dir, f"{start:.2f}.wav")
             sample_result = {"start": round(start, 2), "speech_ratio": None, "talking": False}
             try:
