@@ -117,6 +117,7 @@ class Config:
     retry_backoff_sec: float = 3.0
     cookiefile: Optional[str] = None
     cookies_from_browser: Optional[str] = None   # vd: "chrome"
+    player_clients: Optional[list] = None         # vd: ["web","android"] — để trống = mặc định yt-dlp
 
 
 # 6 điểm mốc 3D chuẩn (đơn vị mm, hệ toạ độ tuỳ ý) dùng để ước lượng headpose
@@ -182,11 +183,13 @@ def get_video_info(url: str, cfg: Config, kind: str = "video", max_height: Optio
         "quiet": True,
         "no_warnings": True,
         "format": build_format_string(kind, max_height),
-        # tránh client android_vr/ios: các client này thường đòi PO token và
-        # trả URL yêu cầu header/context riêng, dễ gây 403 khi ffmpeg gọi lại
-        # bằng header chung chung -> ưu tiên android + web cho ổn định.
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
+    if cfg.player_clients:
+        # Chỉ ép client cụ thể nếu người dùng chủ động chỉ định (--player-clients).
+        # Mặc định để trống -> yt-dlp tự chọn/gộp nhiều client, đáng tin hơn vì
+        # từng client hay bị YouTube bật/tắt định dạng khả dụng khác nhau theo
+        # thời điểm (vd client "android" gần đây hay trả rỗng format do SABR).
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": cfg.player_clients}}
     if cfg.cookiefile:
         ydl_opts["cookiefile"] = cfg.cookiefile
     if cfg.cookies_from_browser:
@@ -607,6 +610,11 @@ def main():
     parser.add_argument("--tier2-min-speech-ratio", type=float, default=0.3)
     parser.add_argument("--cookiefile", default=None)
     parser.add_argument("--cookies-from-browser", default=None, help="vd: chrome, firefox")
+    parser.add_argument(
+        "--player-clients", default=None,
+        help="Chỉ định thủ công client yt-dlp dùng, cách nhau bởi dấu phẩy "
+             "(vd: 'web,android'). Để trống = mặc định yt-dlp tự chọn (khuyến nghị).",
+    )
     args = parser.parse_args()
 
     cfg = Config(
@@ -623,6 +631,7 @@ def main():
         max_workers=args.workers,
         cookiefile=args.cookiefile,
         cookies_from_browser=args.cookies_from_browser,
+        player_clients=[c.strip() for c in args.player_clients.split(",")] if args.player_clients else None,
     )
     os.makedirs(cfg.output_dir, exist_ok=True)
 
