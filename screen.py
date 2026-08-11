@@ -624,7 +624,7 @@ def main():
         cookiefile=args.cookiefile,
         cookies_from_browser=args.cookies_from_browser,
     )
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    os.makedirs(cfg.output_dir, exist_ok=Tsrue)
 
     video_ids = load_video_ids(args.ids_file, args.ids_column)
     logger.info("Bắt đầu sàng lọc %d video với %d worker...", len(video_ids), cfg.max_workers)
