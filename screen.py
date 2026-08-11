@@ -271,6 +271,57 @@ def run_ffmpeg(cmd: list, cfg: Config, out_path: Optional[str] = None) -> None:
             raise RuntimeError(f"ffmpeg exit 0 nhưng output rỗng/quá nhỏ ({out_path}):\n{tail}")
 
 
+def verify_local_stream(path: str, expected_duration: float, cfg: Config,
+                         min_duration_ratio: float = 0.9) -> None:
+    """Xác minh file vừa tải THẬT SỰ decode được trọn vẹn và có độ dài gần
+    đúng kỳ vọng - bước kiểm tra CHỦ LỰC còn thiếu trong kiến trúc trước đó.
+
+    Vấn đề của check cũ (chỉ tồn tại + >= min_valid_file_bytes trong
+    `run_ffmpeg`): `ffmpeg -c copy` khi tải nguyên luồng có thể tạo ra 1
+    file "trông có vẻ ổn" (vài MB, header hợp lệ, Duration tag hợp lệ)
+    nhưng bị THIẾU/HỎNG dữ liệu ở đâu đó - thường do kết nối tới CDN
+    (googlevideo) bị ngắt/timeout GIỮA CHỪNG khi 8 worker cùng tải song
+    song, mà ffmpeg vẫn coi là "đọc hết input -> EOF -> exit 0" một cách
+    hợp lệ. Việc này lộ ra khi cố DECODE (không phải chỉ đọc byte), đúng
+    như log thực tế quan sát được: có video fail ngay ở mốc 0.00s
+    (ffmpeg exit 255 thật, không phải "exit 0 rỗng") - tức là bản thân
+    file local đã hỏng ngay từ đầu, không liên quan gì tới việc seek gần
+    cuối stream nữa.
+
+    => Raise lỗi ở ĐÂY để lớp `retry()` bên ngoài tải lại TOÀN BỘ file từ
+    đầu (không phải chỉ lùi mốc trích frame như trước - cách đó vô ích nếu
+    bản thân file đã hỏng thật)."""
+    # Bước 1: decode toàn bộ, không mux ra gì (-f null -) - lỗi decode thật
+    # sự (frame hỏng, thiếu dữ liệu giữa chừng...) sẽ hiện ở stderr dù exit
+    # code có thể vẫn là 0.
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    if proc.stderr.strip():
+        raise RuntimeError(
+            f"File local '{path}' decode lỗi (nghi tải thiếu/hỏng do mất "
+            f"kết nối giữa chừng):\n{proc.stderr.strip()[-500:]}"
+        )
+
+    # Bước 2: so độ dài THẬT (packet cuối cùng, không phải header Duration)
+    # với độ dài kỳ vọng từ metadata YouTube - lệch quá nhiều -> nghi bị
+    # cắt cụt (dù không có lỗi decode rõ ràng, ví dụ nếu CDN đóng kết nối
+    # đúng ngay ranh giới 1 packet).
+    if expected_duration:
+        real_duration = (
+            probe_local_media_duration(path, "v") or probe_local_media_duration(path, "a")
+        )
+        if real_duration is not None:
+            ratio = real_duration / expected_duration
+            if ratio < min_duration_ratio:
+                raise RuntimeError(
+                    f"File local '{path}' ngắn hơn kỳ vọng nhiều "
+                    f"({real_duration:.1f}s / {expected_duration:.1f}s = "
+                    f"{ratio:.0%}) -> nghi bị cắt giữa chừng khi tải."
+                )
+
+
 def probe_local_media_duration(path: str, stream_type: str = "v") -> Optional[float]:
     """Lấy timestamp của PACKET CUỐI CÙNG thực sự có trong file, qua
     `ffprobe ... packet=pts_time` - đáng tin hơn NHIỀU so với
@@ -574,8 +625,13 @@ def process_video(video_id: str, cfg: Config) -> dict:
         result["duration"] = duration
 
         local_video_path = os.path.join(tmp_dir, "video.mkv")
+
+        def _download_and_verify_video():
+            download_full_stream(info1, local_video_path, cfg)
+            verify_local_stream(local_video_path, duration, cfg)
+
         try:
-            retry(lambda: download_full_stream(info1, local_video_path, cfg), cfg)
+            retry(_download_and_verify_video, cfg)
         except Exception as e:
             result["errors"].append(f"tier1 download stream: {e}")
             result["status"] = "done"
@@ -584,6 +640,9 @@ def process_video(video_id: str, cfg: Config) -> dict:
 
         # Mốc pts packet cuối thật của video-only vừa tải (KHÔNG dùng Duration
         # trong header - xem lý do trong docstring probe_local_media_duration).
+        # Giờ file đã qua verify_local_stream nên số này đáng tin - đây chỉ
+        # còn là bước tinh chỉnh nhẹ (vài trăm ms lệch tự nhiên), không phải
+        # để né 1 file hỏng nữa.
         local_video_duration = probe_local_media_duration(local_video_path, "v")
         if local_video_duration is not None:
             duration = min(duration, local_video_duration)
@@ -630,8 +689,13 @@ def process_video(video_id: str, cfg: Config) -> dict:
             return result
 
         local_audio_path = os.path.join(tmp_dir, "audio.mka")
+
+        def _download_and_verify_audio():
+            download_full_stream(info2, local_audio_path, cfg)
+            verify_local_stream(local_audio_path, duration, cfg)
+
         try:
-            retry(lambda: download_full_stream(info2, local_audio_path, cfg), cfg)
+            retry(_download_and_verify_audio, cfg)
         except Exception as e:
             result["errors"].append(f"tier2 download stream: {e}")
             result["status"] = "done"
